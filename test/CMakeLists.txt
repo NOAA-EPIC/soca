@@ -35,6 +35,7 @@ set( soca_test_input
   testinput/convertstate_changevar.yml
   testinput/convertstate_soca2cice.yml
   testinput/convertstate.yml
+  testinput/converttogauss.yml
   testinput/diffstates.yml
   testinput/dirac_diffusion.yml
   testinput/dirac_diffusion_lowres.yml
@@ -44,6 +45,8 @@ set( soca_test_input
   testinput/dirac_soca_cor_nicas_scales.yml
   testinput/dirac_soca_cov.yml
   testinput/dirac_socahyb_cov.yml
+  testinput/ensanpproc.yml
+  testinput/ensanpproc_ensda.yml
   testinput/enshofx_1.yml
   testinput/enshofx_2.yml
   testinput/enshofx_3.yml
@@ -62,6 +65,7 @@ set( soca_test_input
   testinput/geometry_iterator_2d.yml
   testinput/geometry_iterator_3d.yml
   testinput/geometry.yml
+  testinput/getkf.yml
   testinput/getvalues.yml
   testinput/gridgen.yml
   testinput/hofx_3d.yml
@@ -72,7 +76,7 @@ set( soca_test_input
   testinput/letkf_split_observer.yml
   testinput/letkf_split_solver.yml
   testinput/letkf.yml
-  testinput/linearization_error.yml
+  testinput/letkf3d.yml
   testinput/linearmodel_oceaniceemulator.yml
   testinput/makeobs.yml
   testinput/model.yml
@@ -90,6 +94,7 @@ set( soca_test_input
   testinput/setcorscales.yml
   testinput/sqrtvertloc.yml
   testinput/state.yml
+  testinput/tlm_toolbox_linearization_error.yml
   testinput/varchange_ana2model.yml
   testinput/varchange_balance_TSSSH.yml
   testinput/varchange_balance.yml
@@ -117,6 +122,7 @@ set( soca_test_ref
   testref/convertstate_changevar.test
   testref/convertstate_soca2cice.test
   testref/convertstate.test
+  testref/converttogauss.test
   testref/diffstates.test
   testref/dirac_diffusion.test
   testref/dirac_parametric_ocean_stddev.test
@@ -125,6 +131,8 @@ set( soca_test_ref
   testref/dirac_soca_cor_nicas_scales.test
   testref/dirac_soca_cov.test
   testref/dirac_socahyb_cov.test
+  testref/ensanpproc.test
+  testref/ensanpproc_ensda.test
   testref/enshofx.test
   testref/ensmeanandvariance.test
   testref/enspert.test
@@ -132,6 +140,7 @@ set( soca_test_ref
   testref/forecast_identity.test
   testref/forecast_pseudo.test
   testref/gen_hybrid_linear_model_coeffs.test
+  testref/getkf.test
   testref/gridgen.test
   testref/hofx_3d.test
   testref/hofx_4d_pseudo.test
@@ -140,7 +149,7 @@ set( soca_test_ref
   testref/letkf_split_observer.test
   testref/letkf_split_solver.test
   testref/letkf.test
-  testref/linearization_error.test
+  testref/letkf3d.test
   testref/makeobs.test
   testref/oceanSmoother.test
   testref/parameters_bump_cor_nicas_scales.test
@@ -149,6 +158,7 @@ set( soca_test_ref
   testref/parameters_bump_loc.test
   testref/setcorscales.test
   testref/sqrtvertloc.test
+  testref/tlm_toolbox_linearization_error.test
 )
 
 # Create directory for test input/output/reference and symlink all files
@@ -375,10 +385,9 @@ soca_add_test( NAME geometry_iterator_2d
                SRC  TestGeometryIterator.cc
                TEST_DEPENDS test_soca_gridgen )
 
-# 3D geometry iterator is currently not working (or needed?)
-# soca_add_test( NAME geometry_iterator_3d
-#                SRC  TestGeometryIterator.cc
-#                TEST_DEPENDS test_soca_gridgen )
+soca_add_test( NAME geometry_iterator_3d
+               SRC  TestGeometryIterator.cc
+               TEST_DEPENDS test_soca_gridgen )
 
 soca_add_test( NAME state
                SRC  TestState.cc
@@ -531,6 +540,11 @@ soca_add_test( NAME convertstate
               #  NOTRAPFPE
                TEST_DEPENDS test_soca_gridgen )
 
+# Convert to Gaussian grid
+soca_add_test( NAME converttogauss
+               EXE  soca_converttostructuredgrid.x
+               TEST_DEPENDS test_soca_gridgen )
+
 # Apply a nonlinear change of variable to an ensemble of states
 soca_add_test( NAME convertstate_changevar
                EXE  soca_convertstate.x
@@ -544,6 +558,22 @@ soca_add_test( NAME ensmeanandvariance
 soca_add_test( NAME ensrecenter
                EXE  soca_ensrecenter.x
                TEST_DEPENDS test_soca_gridgen )
+
+file(COPY ${CMAKE_CURRENT_BINARY_DIR}/data_static/72x35x25/restarts/iced.2018-04-15-00000.nc
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/data_generated/ensanpproc/mem.1 )
+file(COPY ${CMAKE_CURRENT_BINARY_DIR}/data_static/72x35x25/restarts/iced.2018-04-15-00000.nc
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/data_generated/ensanpproc/mem.2 )
+file(COPY ${CMAKE_CURRENT_BINARY_DIR}/data_static/72x35x25/restarts/iced.2018-04-15-00000.nc
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/data_generated/ensanpproc/mem.3 )
+file(COPY ${CMAKE_CURRENT_BINARY_DIR}/data_static/72x35x25/restarts/iced.2018-04-15-00000.nc
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/data_generated/ensanpproc/mem.4 )
+soca_add_test( NAME ensanpproc
+               EXE  soca_anpproc.x
+               TEST_DEPENDS test_soca_gridgen )
+
+soca_add_test( NAME ensanpproc_ensda
+               EXE  soca_anpproc.x
+               TEST_DEPENDS test_soca_gridgen test_soca_letkf )
 
 soca_add_test( NAME hybridgain
                EXE  soca_hybridgain.x
@@ -569,8 +599,8 @@ soca_add_test( NAME gen_hybrid_linear_model_coeffs
                             test_soca_forecast_mom6_ens2
                             test_soca_forecast_mom6_ens3 )
 
-soca_add_test( NAME linearization_error
-               EXE  soca_linearization_error.x
+soca_add_test( NAME tlm_toolbox_linearization_error
+               EXE  soca_tlm_toolbox.x
                TEST_DEPENDS test_soca_gridgen
                             test_soca_forecast_mom6
                             test_soca_forecast_mom6_ens1
@@ -770,6 +800,11 @@ soca_add_test( NAME letkf
               #  NOTRAPFPE
                TEST_DEPENDS test_soca_gridgen )
 
+soca_add_test( NAME letkf3d
+               EXE  soca_letkf.x
+              #  NOTRAPFPE
+               TEST_DEPENDS test_soca_gridgen )
+
 soca_add_test( NAME letkf_split_observer
                EXE  soca_letkf.x
               #  NOTRAPFPE
@@ -781,6 +816,10 @@ soca_add_test( NAME letkf_split_solver
                TEST_DEPENDS test_soca_gridgen
                             test_soca_letkf_split_observer )
 
+soca_add_test( NAME getkf
+               EXE  soca_letkf.x
+              #  NOTRAPFPE
+               TEST_DEPENDS test_soca_gridgen )
 
 # other executables that depends on increments from 3dvar_diffusion run
 #---------------------------------------------------------------------------------------------------

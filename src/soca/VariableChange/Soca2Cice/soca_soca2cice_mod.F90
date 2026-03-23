@@ -10,13 +10,14 @@ use fckit_configuration_module, only: fckit_configuration
 use fckit_exception_module, only: fckit_exception
 use fckit_mpi_module, only: fckit_mpi_comm
 use kinds, only: kind_real
+use mpp_domains_mod, only : mpp_update_domains
 
 use icepack_itd, only: icepack_init_itd, cleanup_itd
 use icepack_warnings, only: icepack_warnings_flush, icepack_warnings_aborted
 use icepack_tracers, only: icepack_init_tracer_sizes, icepack_init_tracer_indices
 use icepack_parameters, only: icepack_init_parameters, icepack_recompute_constants
-use icepack_parameters, only: ktherm
-use icepack_therm_shared, only: icepack_liquidus_temperature, l_brine
+use icepack_parameters, only: tfrz_option, ktherm
+use icepack_therm_shared, only: icepack_sea_freezing_temperature, l_brine
 
 use soca_geom_mod, only: soca_geom
 use soca_state_mod, only: soca_state
@@ -42,6 +43,8 @@ type, public :: soca_soca2cice_params
    logical :: rescale_prior
    real(kind=kind_real) :: rescale_min_hice
    real(kind=kind_real) :: rescale_min_hsno
+   logical :: update_sst
+   real(kind=kind_real) :: max_update_sst
 end type soca_soca2cice_params
 
 type, public :: soca_soca2cice
@@ -49,6 +52,8 @@ type, public :: soca_soca2cice
    integer :: myrank
    integer :: ncat, ni, nj, ice_lev, sno_lev, shuffle_n
    real(kind=kind_real) :: dt
+   real(kind=kind_real) :: min_aice, min_vice
+   character(len=:), allocatable :: tfrz_option
    character(len=:), allocatable :: rst_filename
    character(len=:), allocatable :: rst_out_filename
    type(cice_state) :: cice
@@ -80,10 +85,9 @@ subroutine soca_soca2cice_setup(self, geom)
   self%myrank = geom%f_comm%rank()
 
   ! Initialize icepack's global variables ...
-  call icepack_init_parameters()
+  call icepack_init_parameters(ktherm_in = 2, tfrz_option_in = trim(self%tfrz_option))
   call icepack_recompute_constants()
   l_brine = .true.
-  ktherm = 2
   call icepack_init_tracer_sizes(ncat_in=self%ncat, nilyr_in=self%ice_lev, nslyr_in=self%sno_lev)
   ! initialize cice
   call self%cice%init(geom, self%rst_filename, self%rst_out_filename, self%ice_lev, self%sno_lev)
@@ -149,7 +153,7 @@ subroutine check_ice_bounds(self, geom, xm)
   call hsno%data(data_hsno)
 
   ! check seaice fraction bounds
-  where (data_aice<0_kind_real)
+  where (data_aice<self%min_aice)
      data_aice = 0_kind_real
   end where
   where (data_aice>1_kind_real)
@@ -180,17 +184,21 @@ subroutine shuffle_ice(self, geom, xm)
   type(soca_geom), target, intent(in)  :: geom
   type(soca_state),      intent(inout) :: xm
 
-  real(kind=kind_real) :: local_aice, seaice_edge
-  integer :: i, j, k, ii, jj, atlas_idx, halo
+  real(kind=kind_real) :: local_aice, seaice_edge, sst, Tf, max_update_sst
+  logical :: update_sst
+  integer :: i, j, k, ii, jj, atlas_idx, halo, npos
   integer :: minidx(2)
   real(kind=kind_real), allocatable :: testmin(:,:)
 
   type(cice_state) :: cice_in
-  type(atlas_field) :: socn, aice
-  real(kind=kind_real), pointer :: data_socn(:,:), data_aice(:,:)
+  real(kind=kind_real), allocatable :: tocn_in(:,:)
+  type(atlas_field) :: tocn, socn, aice
+  real(kind=kind_real), pointer :: data_tocn(:,:), data_socn(:,:), data_aice(:,:)
 
+  tocn = xm%afieldset%field("sea_water_potential_temperature")
   socn = xm%afieldset%field("sea_water_salinity")
   aice = xm%afieldset%field("sea_ice_area_fraction")
+  call tocn%data(data_tocn)
   call socn%data(data_socn)
   call aice%data(data_aice)
 
@@ -208,7 +216,18 @@ subroutine shuffle_ice(self, geom, xm)
 
   allocate(testmin(2*halo + 1, 2*halo + 1))
 
+  ! make copies of the cice state and sst since the original state
+  ! needs to be used for the shuffle
   call cice_in%copydata(self%cice)
+  allocate(tocn_in(geom%isd:geom%ied, geom%jsd:geom%jed))
+  do j = geom%jsc, geom%jec
+    do i = geom%isc, geom%iec
+      atlas_idx = geom%atlas_ij2idx(i,j)
+      tocn_in(i,j) = data_tocn(1, atlas_idx)
+    end do
+  end do
+  call mpp_update_domains(tocn_in, geom%Domain%mpp_domain)
+
   do j = geom%jsc, geom%jec
      do i = geom%isc, geom%iec
         if (geom%mask2d(i,j) == 0) cycle        ! skip land points
@@ -220,9 +239,13 @@ subroutine shuffle_ice(self, geom, xm)
         if (geom%lat(i,j)>0.0_kind_real) then
           if (.not. self%arctic%shuffle) cycle
           seaice_edge = self%arctic%seaice_edge
+          update_sst = self%arctic%update_sst
+          max_update_sst = self%arctic%max_update_sst
         else
           if (.not. self%antarctic%shuffle) cycle
           seaice_edge = self%antarctic%seaice_edge
+          update_sst = self%antarctic%update_sst
+          max_update_sst = self%antarctic%max_update_sst
         endif
         if (self%cice%aice(i,j).gt.seaice_edge) cycle     ! skip if the background has more ice than the threshold
         if (local_aice.le.0.0_kind_real) then             ! set state to zero if the analysis is zero
@@ -235,7 +258,26 @@ subroutine shuffle_ice(self, geom, xm)
            self%cice%qice(i,j,:,:) = 0_kind_real
            self%cice%sice(i,j,:,:) = 0_kind_real
            self%cice%qsno(i,j,:,:) = 0_kind_real
-           self%cice%tsfcn(i,j,:) = icepack_liquidus_temperature(data_socn(1, atlas_idx))
+           Tf = icepack_sea_freezing_temperature(data_socn(1, atlas_idx))
+           self%cice%tsfcn(i,j,:) = Tf
+           ! adjust SST (when we have some data) if ice is removed and SST is freezing
+           if (update_sst .and. (cice_in%aice(i,j) > 0.0) .and. (data_tocn(1,atlas_idx)<=Tf)) then
+             npos = 1
+             sst = data_tocn(1,atlas_idx)
+             do ii = i - 1, i + 1
+               do jj = j - 1, j + 1
+                 if (cice_in%aice(ii,jj) == 0.0) then
+                   sst = sst + tocn_in(ii,jj)
+                   npos = npos + 1
+                 endif
+               enddo
+             enddo
+             sst = sst / npos
+             if (sst > data_tocn(1,atlas_idx) + max_update_sst) then
+               sst = data_tocn(1, atlas_idx) + max_update_sst
+             endif
+             data_tocn(1, atlas_idx) = sst
+           endif
            cycle
         endif
         do ii = i - halo, i + halo
@@ -263,9 +305,17 @@ subroutine shuffle_ice(self, geom, xm)
         do k = 1, self%sno_lev
            self%cice%qsno(i, j,: , k) = cice_in%qsno(ii, jj, :, k)
         end do
+        ! adjust SST when ice is added
+        if (update_sst .and. (self%cice%aice(i, j) > 0.0) .and. (cice_in%aice(i,j) == 0.0)) then
+           local_aice = self%cice%aice(i, j)
+           sst = local_aice * icepack_sea_freezing_temperature(data_socn(1, atlas_idx)) + &
+                 (1.0_kind_real - local_aice) * data_tocn(1, atlas_idx)
+           data_tocn(1, atlas_idx) = sst
+        endif
      end do
   end do
-
+  deallocate(tocn_in)
+  call tocn%final()
   call socn%final()
   call aice%final()
 end subroutine shuffle_ice
@@ -373,7 +423,7 @@ subroutine cleanup_ice(self, geom, xm)
 
         ! call icepack_cleanup_itd: rebins thickness categories if necessary,
         ! eliminates very small ice areas while conserving mass and energy
-        Tf = icepack_liquidus_temperature(data_socn(1, idx))
+        Tf = icepack_sea_freezing_temperature(data_socn(1, idx))
         call cleanup_itd(self%dt, h_bounds, self%cice%aicen(i,j,:), tracers, &
                          self%cice%vicen(i,j,:), self%cice%vsnon(i,j,:), &
                          ! ice and total water concentration are computed in the call using aicen
@@ -397,10 +447,10 @@ subroutine cleanup_ice(self, geom, xm)
         if (icepack_warnings_aborted()) then
            call abor1_ftn("Soca2Cice: icepack aborted during cleanup_itd")
         endif
-        ! remove ice if ice volume is less than 0.00001: empirical hack
+        ! remove ice if ice volume is less than min_vice: empirical hack
         ! https://github.com/NOAA-EMC/GDASApp/issues/1575
         do k = 1, self%ncat
-          if ((self%cice%aicen(i,j,k) > 0.0) .and. (self%cice%vicen(i,j,k) < 0.00001)) then
+          if ((self%cice%aicen(i,j,k) > 0.0) .and. (self%cice%vicen(i,j,k) < self%min_vice)) then
             count_thinice = count_thinice + 1
             self%cice%aicen(i,j,k) = 0_kind_real
             self%cice%vicen(i,j,k) = 0_kind_real
@@ -431,6 +481,11 @@ subroutine cleanup_ice(self, geom, xm)
         data_aice(1, idx) = sum(self%cice%aicen(i,j,:))
         data_hice(1, idx) = sum(self%cice%vicen(i,j,:))
         data_hsno(1, idx) = sum(self%cice%vsnon(i,j,:))
+        ! compute thickness from volume
+        if (data_aice(1, idx)> 0.0) then
+          data_hice(1, idx) = data_hice(1, idx) / data_aice(1, idx)
+          data_hsno(1, idx) = data_hsno(1, idx) / data_aice(1, idx)
+        endif
      end do
   end do
   if (count_thinice > 0) then
@@ -502,18 +557,19 @@ subroutine prior_dist_rescale(self, geom, xm)
            self%cice%vsnon(i,j,c) = alpha*self%cice%vsnon(i,j,c)
         end do
 
-        ! adjust ice volume to match mean cell thickness
-        local_hice = sum(self%cice%vicen(i,j,:))
-        if (local_hice.gt.rescale_min_hice) then
-           alpha = data_hice(1, idx)/local_hice
-           self%cice%vicen(i,j,:) = alpha*self%cice%vicen(i,j,:)
-        end if
-
-        ! adjust snow volume to match mean cell thickness
-        local_hsno = sum(self%cice%vsnon(i,j,:))
-        if (local_hsno.gt.rescale_min_hsno) then
-           alpha = data_hsno(1, idx)/local_hsno
-           self%cice%vsnon(i,j,:) = alpha*self%cice%vsnon(i,j,:)
+        if (self%cice%aice(i,j).gt.0.0) then
+          ! adjust ice volume to match mean cell thickness
+          local_hice = sum(self%cice%vicen(i,j,:))/self%cice%aice(i,j)
+          if (local_hice.gt.rescale_min_hice) then
+             alpha = data_hice(1, idx)/local_hice
+             self%cice%vicen(i,j,:) = alpha*self%cice%vicen(i,j,:)
+          end if
+          ! adjust snow volume to match mean cell thickness
+          local_hsno = sum(self%cice%vsnon(i,j,:))/self%cice%aice(i,j)
+          if (local_hsno.gt.rescale_min_hsno) then
+             alpha = data_hsno(1, idx)/local_hsno
+             self%cice%vsnon(i,j,:) = alpha*self%cice%vsnon(i,j,:)
+          end if
         end if
     end do
   end do
